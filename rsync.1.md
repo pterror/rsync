@@ -1084,7 +1084,11 @@ expand it.
       data in the destination file is overwritten before it can be copied to a
       position later in the file.  This does not apply if you use [`--backup`](#opt),
       since rsync is smart enough to use the backup file as the basis file for
-      the transfer.
+      the transfer.  Note that in this combination the backup is **not merely a
+      safety copy**: it is the read-only basis that the delta transfer reads from
+      while the destination is overwritten in place, so it is a required part of
+      the transfer — the destination can only be updated when the backup file can
+      be created.
 
     WARNING: you should not use this option to update files that are being
     accessed by others, so be careful when choosing to use this for a copy.
