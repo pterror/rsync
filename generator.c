@@ -771,17 +771,25 @@ static void sum_sizes_sqroot(struct sum_struct *sum, int64 len)
  * Generate and send a stream of signatures/checksums that describe a buffer
  *
  * Generate approximately one checksum every block_len bytes.
+ *
+ * Returns 0 on success, GSS_TOO_LARGE if the file is too large to checksum, or
+ * GSS_BACKUP_FAILED if writing the inplace-backup copy (f_copy) failed.  In the
+ * last case backup_name is used for the error message and the caller must NOT
+ * finalize the (now truncated/corrupt) backup.
  */
-static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
+#define GSS_TOO_LARGE (-1)
+#define GSS_BACKUP_FAILED (-2)
+static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy, const char *backup_name)
 {
 	int32 i;
 	struct map_struct *mapbuf;
 	struct sum_struct sum;
 	OFF_T offset = 0;
+	int backup_failed = 0;
 
 	sum_sizes_sqroot(&sum, len);
 	if (sum.count < 0)
-		return -1;
+		return GSS_TOO_LARGE;
 	write_sum_head(f_out, &sum);
 
 	if (append_mode > 0 && f_copy < 0)
@@ -802,7 +810,23 @@ static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
 		offset += n1;
 
 		if (f_copy >= 0) {
-			full_write(f_copy, map, n1);
+			/* If the inplace backup copy cannot be written in full
+			 * (a genuine write error such as ENOSPC/EDQUOT/EFBIG --
+			 * full_write() already loops over short writes), the
+			 * backup would be left truncated.  Report the error and
+			 * stop writing the backup, but keep sending the rest of
+			 * the checksum stream: write_sum_head() above already
+			 * committed the receiver to read exactly sum.count
+			 * blocks, so bailing out of this loop early would
+			 * deadlock the transfer.  The caller is told via
+			 * GSS_BACKUP_FAILED so it discards the truncated backup
+			 * instead of finalizing it as a valid one, and the
+			 * FERROR_XFER makes rsync exit non-zero. */
+			if (!backup_failed && full_write(f_copy, map, n1) != n1) {
+				rsyserr(FERROR_XFER, errno, "write %s",
+					full_fname(backup_name));
+				backup_failed = 1;
+			}
 			if (append_mode > 0)
 				continue;
 		}
@@ -823,7 +847,7 @@ static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
 	if (mapbuf)
 		unmap_file(mapbuf);
 
-	return 0;
+	return backup_failed ? GSS_BACKUP_FAILED : 0;
 }
 
 
@@ -1964,21 +1988,46 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 	else if (sx.st.st_size <= 0) {
 		write_sum_head(f_out, NULL);
 	} else {
-		if (generate_and_send_sums(fd, sx.st.st_size, f_out, f_copy) < 0) {
+		int gss_ret = generate_and_send_sums(fd, sx.st.st_size, f_out, f_copy, backupptr);
+		if (gss_ret == GSS_TOO_LARGE) {
 			rprintf(FWARNING,
 				"WARNING: file is too large for checksum sending: %s\n",
 				fnamecmp);
 			write_sum_head(f_out, NULL);
+		} else if (gss_ret == GSS_BACKUP_FAILED) {
+			/* The inplace backup copy could not be written in full
+			 * (generate_and_send_sums already reported the error via
+			 * FERROR_XFER, which makes rsync exit non-zero).  Discard
+			 * the truncated backup and do not finalize it (mirrors
+			 * the whole-file copy_file() failure path above): the
+			 * set_file_attrs() and "backed up" log below are skipped,
+			 * so a failed backup -- and the fact that the original is
+			 * being overwritten in place with no good backup -- is
+			 * surfaced rather than silently hidden. */
+			close(f_copy);
+			f_copy = -1;
+			do_unlink_at(backupptr);
+			unmake_file(back_file);
+			back_file = NULL;
 		}
 	}
 
   cleanup:
 	if (fd >= 0)
 		close(fd);
+	/* A close error on f_copy is the deferred-error tail of the backup
+	 * copy: buffered/deferred write errors can surface only at close().
+	 * Treat it like a copy failure -- report it, discard the possibly-
+	 * corrupt backup, and skip finalizing/logging it as a successful one. */
+	if (back_file && f_copy >= 0 && close(f_copy) < 0) {
+		rsyserr(FERROR_XFER, errno, "close failed on %s",
+			full_fname(backupptr));
+		do_unlink_at(backupptr);
+		unmake_file(back_file);
+		back_file = NULL;
+	}
 	if (back_file) {
 		int save_preserve_xattrs = preserve_xattrs;
-		if (f_copy >= 0)
-			close(f_copy);
 #ifdef SUPPORT_XATTRS
 		if (preserve_xattrs) {
 			copy_xattrs(fname, backupptr);
