@@ -772,7 +772,7 @@ static void sum_sizes_sqroot(struct sum_struct *sum, int64 len)
  *
  * Generate approximately one checksum every block_len bytes.
  */
-static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
+static int generate_and_send_sums(int fd, OFF_T len, int f_out)
 {
 	int32 i;
 	struct map_struct *mapbuf;
@@ -784,7 +784,7 @@ static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
 		return -1;
 	write_sum_head(f_out, &sum);
 
-	if (append_mode > 0 && f_copy < 0)
+	if (append_mode > 0)
 		return 0;
 
 	if (len > 0)
@@ -800,12 +800,6 @@ static int generate_and_send_sums(int fd, OFF_T len, int f_out, int f_copy)
 
 		len -= n1;
 		offset += n1;
-
-		if (f_copy >= 0) {
-			full_write(f_copy, map, n1);
-			if (append_mode > 0)
-				continue;
-		}
 
 		sum1 = get_checksum1(map, n1);
 		get_checksum2(map, n1, sum2);
@@ -1229,7 +1223,7 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 	static struct file_list *fuzzy_dirlist[MAX_BASIS_DIRS+1];
 	static int need_fuzzy_dirlist = 0;
 	struct file_struct *fuzzy_file = NULL;
-	int fd = -1, f_copy = -1;
+	int fd = -1;
 	stat_x sx, real_sx;
 	STRUCT_STAT partial_st;
 	struct file_struct *back_file = NULL;
@@ -1902,15 +1896,21 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 		if (!(back_file = make_file(fname, NULL, NULL, 0, NO_FILTERS))) {
 			goto pretend_missing;
 		}
-		if (robust_unlink(backupptr) && errno != ENOENT) {
-			rsyserr(FERROR_XFER, errno, "unlink %s",
-				full_fname(backupptr));
-			unmake_file(back_file);
-			back_file = NULL;
-			goto cleanup;
-		}
-		if ((f_copy = do_open_at(backupptr, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL, 0600)) < 0) {
-			rsyserr(FERROR_XFER, errno, "open %s", full_fname(backupptr));
+		/* Under --inplace --backup the backup is the read-only delta
+		 * basis the receiver reads while overwriting the destination in
+		 * place, so it must be a complete, verified copy of the original
+		 * before any part of the transfer is committed to the wire.
+		 * Mirror the whole-file path: do a discrete copy_file() now and,
+		 * on failure, discard the partial and skip the file so the
+		 * original destination is left byte-intact.  copy_file() reports
+		 * its own FERROR_XFER on failure (exit 23). */
+		if (copy_file(fname, backupptr, -1, back_file->mode) < 0) {
+			/* The backup copy failed; discard whatever partial it
+			 * left, since copy_file() does not clean up after
+			 * itself.  This is no worse than the prior behaviour,
+			 * which unlinked the old backup unconditionally before
+			 * even attempting the copy. */
+			do_unlink_at(backupptr);
 			unmake_file(back_file);
 			back_file = NULL;
 			goto cleanup;
@@ -1964,7 +1964,7 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 	else if (sx.st.st_size <= 0) {
 		write_sum_head(f_out, NULL);
 	} else {
-		if (generate_and_send_sums(fd, sx.st.st_size, f_out, f_copy) < 0) {
+		if (generate_and_send_sums(fd, sx.st.st_size, f_out) < 0) {
 			rprintf(FWARNING,
 				"WARNING: file is too large for checksum sending: %s\n",
 				fnamecmp);
@@ -1977,8 +1977,6 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 		close(fd);
 	if (back_file) {
 		int save_preserve_xattrs = preserve_xattrs;
-		if (f_copy >= 0)
-			close(f_copy);
 #ifdef SUPPORT_XATTRS
 		if (preserve_xattrs) {
 			copy_xattrs(fname, backupptr);
